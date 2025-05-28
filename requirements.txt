@@ -2,4 +2,6 @@ streamlit
 geopandas
 fiona
 pandas
-openpyxl
+psycopg2-binary
+shapely
+pyproj
