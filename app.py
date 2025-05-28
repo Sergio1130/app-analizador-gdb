@@ -6,12 +6,41 @@ import tempfile
 import shutil
 import os
 import zipfile
+import psycopg2
 
+# Configuración inicial
 st.set_page_config(page_title="Analizador GDB", layout="centered")
 
-st.title("🔍 Analizador de Geodatabase (.gdb)")
-st.markdown("Sube una carpeta .gdb comprimida en ZIP, analizaremos las capas y podrás descargar el reporte.")
+# === CONFIGURA TU CADENA DE CONEXIÓN A NEON ===
+DB_URL = "postgresql://conexion_owner:npg_9juUgt3dVlFZ@ep-delicate-violet-a8on7fxn-pooler.eastus2.azure.neon.tech/conexion?sslmode=require"
 
+# === FUNCIÓN DE LOGIN ===
+def verificar_usuario(usuario, contrasena):
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM usuarios WHERE usuario = %s AND contrasena = %s", (usuario, contrasena))
+        resultado = cur.fetchone()
+        cur.close()
+        conn.close()
+        return resultado is not None
+    except Exception as e:
+        st.error(f"Error al conectar a la base de datos: {e}")
+        return False
+
+def login():
+    st.title("🔐 Iniciar sesión")
+    usuario = st.text_input("Usuario")
+    contrasena = st.text_input("Contraseña", type="password")
+
+    if st.button("Iniciar sesión"):
+        if verificar_usuario(usuario, contrasena):
+            st.session_state["logueado"] = True
+            st.success("✅ Acceso permitido")
+        else:
+            st.error("❌ Usuario o contraseña incorrectos")
+
+# === CARGA EL DICCIONARIO DE CAMPOS ===
 @st.cache_data
 def cargar_diccionario_mag():
     try:
@@ -27,60 +56,63 @@ def obtener_obligacion(mag_df, capa, campo):
         return row.iloc[0]["OBLIGACIÓN/CONDICIÓN"]
     return "Desconocido"
 
-# Cargar diccionario
-mag_df = cargar_diccionario_mag()
+# === INTERFAZ PRINCIPAL PROTEGIDA POR LOGIN ===
+if "logueado" not in st.session_state or not st.session_state["logueado"]:
+    login()
+else:
+    st.title("🔍 Analizador de Geodatabase (.gdb)")
+    st.markdown("Sube una carpeta .gdb comprimida en ZIP, analizaremos las capas y podrás descargar el reporte.")
 
-# Subir archivo ZIP con la GDB
-archivo_zip = st.file_uploader("📁 Sube tu archivo .gdb en formato ZIP", type=["zip"])
+    mag_df = cargar_diccionario_mag()
 
-if archivo_zip:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, "temp.zip")
-        with open(zip_path, "wb") as f:
-            f.write(archivo_zip.read())
+    archivo_zip = st.file_uploader("📁 Sube tu archivo .gdb en formato ZIP", type=["zip"])
 
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(tmpdir)
+    if archivo_zip:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "temp.zip")
+            with open(zip_path, "wb") as f:
+                f.write(archivo_zip.read())
 
-        gdb_dirs = [os.path.join(tmpdir, d) for d in os.listdir(tmpdir) if d.endswith(".gdb")]
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(tmpdir)
 
-        if gdb_dirs:
-            gdb_path = gdb_dirs[0]
-            capas = fiona.listlayers(gdb_path)
-            resultado = []
+            gdb_dirs = [os.path.join(tmpdir, d) for d in os.listdir(tmpdir) if d.endswith(".gdb")]
 
-            progress = st.progress(0)
-            for i, capa in enumerate(capas):
-                try:
-                    gdf = gpd.read_file(gdb_path, layer=capa)
-                    for col in gdf.columns:
-                        if col == "geometry":
-                            continue
-                        nulos = gdf[col].isnull().sum()
-                        ceros = ((gdf[col] == 0) & gdf[col].notnull()).sum() if pd.api.types.is_numeric_dtype(gdf[col]) else 0
-                        obligacion = obtener_obligacion(mag_df, capa, col)
+            if gdb_dirs:
+                gdb_path = gdb_dirs[0]
+                capas = fiona.listlayers(gdb_path)
+                resultado = []
 
-                        if nulos > 0:
-                            resultado.append(["Valores Nulos", capa, col, obligacion])
-                        if ceros > 0:
-                            resultado.append(["Valores en Cero", capa, col, obligacion])
-                except Exception as e:
-                    st.warning(f"⚠️ Error en capa {capa}: {e}")
-                progress.progress((i + 1) / len(capas))
+                progress = st.progress(0)
+                for i, capa in enumerate(capas):
+                    try:
+                        gdf = gpd.read_file(gdb_path, layer=capa)
+                        for col in gdf.columns:
+                            if col == "geometry":
+                                continue
+                            nulos = gdf[col].isnull().sum()
+                            ceros = ((gdf[col] == 0) & gdf[col].notnull()).sum() if pd.api.types.is_numeric_dtype(gdf[col]) else 0
+                            obligacion = obtener_obligacion(mag_df, capa, col)
 
-            if resultado:
-                df_result = pd.DataFrame(resultado, columns=["Inconsistencia", "Capa/Tabla", "Campo", "OBLIGACIÓN/CONDICIÓN"])
-                st.success("✔ Análisis completado")
+                            if nulos > 0:
+                                resultado.append(["Valores Nulos", capa, col, obligacion])
+                            if ceros > 0:
+                                resultado.append(["Valores en Cero", capa, col, obligacion])
+                    except Exception as e:
+                        st.warning(f"⚠️ Error en capa {capa}: {e}")
+                    progress.progress((i + 1) / len(capas))
 
-                # Exportar a Excel
-                output = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-                df_result.to_excel(output.name, index=False)
-                output.seek(0)
+                if resultado:
+                    df_result = pd.DataFrame(resultado, columns=["Inconsistencia", "Capa/Tabla", "Campo", "OBLIGACIÓN/CONDICIÓN"])
+                    st.success("✔ Análisis completado")
 
-                with open(output.name, "rb") as f:
-                    st.download_button("📥 Descargar reporte Excel", f, file_name="reporte_inconsistencias.xlsx")
+                    output = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+                    df_result.to_excel(output.name, index=False)
+                    output.seek(0)
 
+                    with open(output.name, "rb") as f:
+                        st.download_button("📥 Descargar reporte Excel", f, file_name="reporte_inconsistencias.xlsx")
+                else:
+                    st.success("✔ Sin inconsistencias encontradas")
             else:
-                st.success("✔ Sin inconsistencias encontradas")
-        else:
-            st.error("❌ No se encontró ninguna carpeta .gdb en el ZIP subido.")
+                st.error("❌ No se encontró ninguna carpeta .gdb en el ZIP subido.")
